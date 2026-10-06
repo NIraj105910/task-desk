@@ -412,7 +412,7 @@ textarea.inp { resize: vertical; min-height: 76px; }
     <span class="note-ic"><svg class="ic" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="5.5" r="2.3"/><path d="M1.8 13c.4-2.2 2-3.4 4.2-3.4s3.8 1.2 4.2 3.4M12 4.5v4M10 6.5h4"/></svg></span>
     <div class="note-b">
       <h2>Send this board to your manager</h2>
-      <p>Copy the manager link and send it to them. It opens the board in manager view, with no sign-in.</p>
+      <p>Copy the manager link and send it to them. It always opens the board in manager view, with no sign-in.</p>
       <div><button class="btn btn-sm" id="copy-mgr" type="button" style="margin-top:8px">Copy manager link</button></div>
       <p class="link-box" id="mgr-link" hidden></p>
     </div>
@@ -516,7 +516,7 @@ textarea.inp { resize: vertical; min-height: 76px; }
     <label class="fld"><span>Your name</span>
       <input class="inp" id="who-name" type="text" maxlength="40" placeholder="e.g. Rajneesh">
     </label>
-    <fieldset class="fld"><legend>Who are you on this board?</legend>
+    <fieldset class="fld" id="who-role-fld"><legend>Who are you on this board?</legend>
       <div class="opts">
         <label class="opt"><input type="radio" name="who-role" id="who-owner" value="owner" checked><span>These are my tasks</span></label>
         <label class="opt"><input type="radio" name="who-role" id="who-manager" value="manager"><span>I am the manager</span></label>
@@ -609,6 +609,7 @@ var FIREBASE_CONFIG = {
   };
   var rows = new Map();   // task id -> { el, sig }
   var chains = new Map(); // task id -> promise chain, one write at a time per task
+  var MGR_LINK = /(^|[#&])manager\b/i.test(location.hash);
   var ptrDown = false, toastTimer = 0, armTimer = 0, sheetId = null, drag = null, cId = null;
 
   function store(k, v) { try { localStorage.setItem('taskdesk.' + k, v); } catch (e) {} }
@@ -715,7 +716,8 @@ var FIREBASE_CONFIG = {
     if (t.notes) lines.push('Description: ' + t.notes);
     if (extra) lines.push('', extra);
     lines.push('', 'Open the board: ' + location.origin + location.pathname);
-    sendMail(S.notifyUrl, 'Task Desk: ' + who + ' ' + what + ' - ' + t.title, lines);
+    sendMail(S.notifyUrl, 'Task Desk: ' + who + ' ' + what + ' - ' + t.title, lines)
+      .then(function (ok) { toast(ok ? 'Saved. Email alert sent to the board owner.' : 'Saved, but the email alert could not be sent.'); });
   }
   function readSnap(snap) {
     var url = '', tasks = [];
@@ -1375,8 +1377,9 @@ var FIREBASE_CONFIG = {
   var who = $('who');
   function askWho() {
     $('who-name').value = S.name;
-    var hashRole = /manager/i.test(location.hash) ? 'manager' : null;
-    setRadio('who-role', S.name ? role() : (hashRole || 'owner'));
+    $('who-role-fld').hidden = MGR_LINK;
+    $('who-title').textContent = MGR_LINK ? 'Welcome, manager' : 'Welcome to Task Desk';
+    setRadio('who-role', role());
     $('who-err').textContent = '';
     if (!who.open) { if (who.showModal) who.showModal(); else who.setAttribute('open', ''); }
     $('who-name').focus();
@@ -1386,8 +1389,9 @@ var FIREBASE_CONFIG = {
     ev.preventDefault();
     var n = nm($('who-name').value);
     if (!n) { $('who-err').textContent = 'Add your name so the other person knows who made a change.'; $('who-name').focus(); return; }
-    S.name = n; S.isOwner = getRadio('who-role') !== 'manager';
-    store('name', n); store('role', role());
+    S.name = n; S.isOwner = MGR_LINK ? false : getRadio('who-role') !== 'manager';
+    store('name.' + role(), n);
+    if (!MGR_LINK) store('role', role());
     if (who.close) who.close(); else who.removeAttribute('open');
     render();
   });
@@ -1401,8 +1405,9 @@ var FIREBASE_CONFIG = {
   });
 
   /* ---------- boot ---------- */
-  S.name = nm(recall('name'));
-  S.isOwner = recall('role') !== 'manager';
+  S.isOwner = MGR_LINK ? false : recall('role') !== 'manager';
+  S.name = nm(recall('name.' + role())) || ((recall('role') === 'manager') === !S.isOwner ? nm(recall('name')) : '');
+  window.addEventListener('hashchange', function () { location.reload(); });
   render();
   (function boot() {
     if (!FIREBASE_CONFIG || !window.firebase) {
