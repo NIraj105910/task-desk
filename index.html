@@ -94,6 +94,8 @@ button:disabled { cursor: default; }
 .brand-name { font: 700 0.9375rem/1 var(--display); }
 button.role { border: 0; cursor: pointer; }
 .role { font: 600 0.75rem/1 var(--body); padding: 6px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.brand-r { display: flex; align-items: center; gap: 4px; }
+.icon-btn.on { color: var(--accent); }
 .sync { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 0.8125rem; color: var(--muted); white-space: nowrap; }
 .sync::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .sync[data-s="live"]::before { background: var(--green); }
@@ -380,7 +382,10 @@ textarea.inp { resize: vertical; min-height: 76px; }
       <span class="brand-name">Task Desk</span>
       <button type="button" class="role" id="role" title="Change your name or role" hidden></button>
     </div>
-    <p id="sync" class="sync" data-s="wait" aria-live="polite">Connecting</p>
+    <div class="brand-r">
+      <button class="icon-btn" id="notify-btn" type="button" aria-label="Email alerts" title="Email alerts" hidden><svg class="ic" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="2"/><path d="M2.5 5l5.5 4 5.5-4"/></svg></button>
+      <p id="sync" class="sync" data-s="wait" aria-live="polite">Connecting</p>
+    </div>
   </div>
 
   <header class="hello">
@@ -522,6 +527,28 @@ textarea.inp { resize: vertical; min-height: 76px; }
   </form>
 </dialog>
 
+<dialog class="sheet" id="ndlg" aria-labelledby="n-title">
+  <form id="n-form" novalidate autocomplete="off">
+    <div class="sheet-head">
+      <h2 id="n-title">Email alerts</h2>
+      <button class="icon-btn" id="n-close" type="button" aria-label="Close"><svg class="ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
+    <p class="sub" style="margin:0">Get an email when your manager adds a task, changes a priority, comments, or marks a task urgent.</p>
+    <label class="fld"><span>Your alert link</span>
+      <input class="inp" id="n-url" type="url" placeholder="https://script.google.com/macros/s/.../exec">
+      <small>Paste the web app link from the one-time Google setup.</small>
+    </label>
+    <p id="n-status" class="sub" style="margin:0"></p>
+    <p id="n-err" class="err" role="alert"></p>
+    <div class="sheet-foot">
+      <button class="btn btn-danger" id="n-off" type="button" hidden>Turn off</button>
+      <span class="grow"></span>
+      <button class="btn" id="n-test" type="button">Send test email</button>
+      <button class="btn btn-primary" id="n-save" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog class="sheet" id="cdlg" aria-labelledby="c-title">
   <form id="c-form" novalidate autocomplete="off">
     <div class="sheet-head">
@@ -576,7 +603,7 @@ var FIREBASE_CONFIG = {
   };
 
   var S = {
-    db: null, name: '', isOwner: true, readOnly: false,
+    db: null, name: '', isOwner: true, readOnly: false, notifyUrl: '',
     state: 'connecting', msg: '', tasks: [], pending: false,
     filter: 'open', sort: 'priority', dirty: false, tipOff: false
   };
@@ -672,6 +699,36 @@ var FIREBASE_CONFIG = {
     };
   }
 
+  /* ---------- email alerts (sent from the manager's browser to the owner's alert link) ---------- */
+  function validUrl(u) { return typeof u === 'string' && /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(u); }
+  function sendMail(url, subject, lines) {
+    try {
+      return fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ subject: subject, body: lines.join('\n') }) })
+        .then(function () { return true; }, function () { return false; });
+    } catch (e) { return Promise.resolve(false); }
+  }
+  function notify(what, t, extra) {
+    if (S.isOwner || !S.notifyUrl || !t) return;
+    var who = S.name || 'Your manager';
+    var lines = [who + ' ' + what + '.', '', 'Task: ' + t.title, 'Priority: ' + label(PRI, t.priority), 'Status: ' + label(STA, t.status)];
+    if (t.due) lines.push('Due: ' + fmtDate(t.due));
+    if (t.notes) lines.push('Description: ' + t.notes);
+    if (extra) lines.push('', extra);
+    lines.push('', 'Open the board: ' + location.origin + location.pathname);
+    sendMail(S.notifyUrl, 'Task Desk: ' + who + ' ' + what + ' - ' + t.title, lines);
+  }
+  function readSnap(snap) {
+    var url = '', tasks = [];
+    snap.docs.forEach(function (d) {
+      if (d.id.charAt(0) === '_') { // board settings live beside the tasks
+        if (d.id === '_settings') { var x = d.data() || {}; if (validUrl(x.notifyUrl)) url = x.notifyUrl; }
+        return;
+      }
+      tasks.push(norm(d));
+    });
+    S.tasks = tasks; S.notifyUrl = url;
+  }
+
   /* ---------- people ---------- */
   function isMe(name, r) { return r === role() && (!name || name === S.name); }
   function whoText(name, r, cap) {
@@ -731,8 +788,13 @@ var FIREBASE_CONFIG = {
   function setPriority(id, v) {
     var t = live(id);
     if (!t || t.priority === v || PRI_RANK[v] == null) return;
+    var was = t.priority;
     patch(id, { priority: v, rank: Date.now(), priorityByRole: role(), priorityByName: S.name })
-      .then(function (ok) { if (ok) toast('Moved to ' + label(PRI, v) + '.'); });
+      .then(function (ok) {
+        if (!ok) return;
+        toast('Moved to ' + label(PRI, v) + '.');
+        notify('changed a priority from ' + label(PRI, was) + ' to ' + label(PRI, v), Object.assign({}, t, { priority: v }));
+      });
   }
   function toggleUrgent(id) {
     var t = live(id); if (!t) return;
@@ -740,7 +802,7 @@ var FIREBASE_CONFIG = {
       patch(id, { urgent: false, ack: false }).then(function (ok) { if (ok) toast('Urgent flag removed.'); });
     } else {
       patch(id, { urgent: true, ack: false, urgentByName: S.name, urgentByRole: role(), urgentAt: new Date().toISOString() })
-        .then(function (ok) { if (ok) toast('Marked urgent. The board owner now sees an alert at the top.'); });
+        .then(function (ok) { if (ok) { toast('Marked urgent. The board owner now sees an alert at the top.'); notify('marked a task urgent', t); } });
     }
   }
   function acknowledge(id) {
@@ -830,7 +892,12 @@ var FIREBASE_CONFIG = {
       if (due !== t.due) data.due = due;
       if (pr !== t.priority) { data.priority = pr; data.rank = Date.now(); data.priorityByRole = role(); data.priorityByName = S.name; }
       closeSheet();
-      if (Object.keys(data).length) patch(id, data).then(function (ok) { if (ok) toast('Changes saved.'); });
+      var oldPri = t.priority, after = Object.assign({}, t, data);
+      if (Object.keys(data).length) patch(id, data).then(function (ok) {
+        if (!ok) return;
+        toast('Changes saved.');
+        if (data.priority) notify('changed a priority from ' + label(PRI, oldPri) + ' to ' + label(PRI, data.priority), after);
+      });
       return;
     }
     var now = new Date().toISOString();
@@ -843,7 +910,7 @@ var FIREBASE_CONFIG = {
     var ref = S.db.collection('tasks').doc();
     closeSheet();
     if (!matches(doc, S.filter)) setFilter(doc.status === 'done' ? 'done' : 'open');
-    write(ref.id, 'create', function () { return ref.set(doc); }).then(function (ok) { if (ok) toast('Task added.'); });
+    write(ref.id, 'create', function () { return ref.set(doc); }).then(function (ok) { if (ok) { toast('Task added.'); notify('added a new task', doc); } });
   });
 
   /* ---------- comments ---------- */
@@ -883,7 +950,10 @@ var FIREBASE_CONFIG = {
     $('c-text').value = '';
     write(id, 'update', function () {
       return S.db.doc('tasks/' + id).update({ comments: firebase.firestore.FieldValue.arrayUnion(c), updatedAt: c.at });
-    }).then(function (ok) { if (!ok) { $('c-text').value = text; $('c-err').textContent = 'That did not send. Try again.'; } });
+    }).then(function (ok) {
+      if (!ok) { $('c-text').value = text; $('c-err').textContent = 'That did not send. Try again.'; return; }
+      notify('commented on a task', live(id), 'Comment: ' + c.text);
+    });
   });
 
   /* ---------- task card ---------- */
@@ -1006,6 +1076,11 @@ var FIREBASE_CONFIG = {
     rp.hidden = !S.name;
     rp.textContent = S.isOwner ? 'Your board' : 'Manager view';
     $('new-btn').hidden = !canAdd; $('fab').hidden = !canAdd;
+    var nb = $('notify-btn');
+    nb.hidden = !(live_ && S.isOwner && S.name);
+    nb.classList.toggle('on', !!S.notifyUrl);
+    nb.title = S.notifyUrl ? 'Email alerts are on' : 'Set up email alerts';
+    nb.setAttribute('aria-label', nb.title);
 
     var total = S.tasks.length, open = 0, late = 0, week = 0, today = dnum(todayStr());
     S.tasks.forEach(function (t) {
@@ -1137,7 +1212,7 @@ var FIREBASE_CONFIG = {
     S.dirty = false;
     var keepId = document.activeElement && document.activeElement.id;
     renderHead(); renderAlert(); renderTools(); renderList(); renderComments();
-    if (keepId && !dlg.open && !cdlg.open && (document.activeElement === document.body || !document.activeElement)) {
+    if (keepId && !dlg.open && !cdlg.open && !ndlg.open && (document.activeElement === document.body || !document.activeElement)) {
       var e = $(keepId); if (e && !e.disabled) e.focus({ preventScroll: true });
     }
   }
@@ -1247,17 +1322,54 @@ var FIREBASE_CONFIG = {
     if (!t || stayed || PRI_RANK[pri] == null) { render(); return; }
     var a = prev ? live(prev.id.slice(5)) : null, b = next ? live(next.id.slice(5)) : null;
     var rank = a && b ? (a.rank + b.rank) / 2 : a ? a.rank + 1000 : b ? b.rank - 1000 : Date.now();
-    var moved = pri !== t.priority, data = { rank: rank };
+    var moved = pri !== t.priority, data = { rank: rank }, wasPri = t.priority;
     if (moved) { data.priority = pri; data.priorityByRole = role(); data.priorityByName = S.name; }
     // show the move straight away; the saved copy follows
     t.rank = rank;
     if (moved) { t.priority = pri; t.priorityByRole = data.priorityByRole; t.priorityByName = data.priorityByName; }
     render();
     patch(d.id, data).then(function (ok) {
-      if (ok) { if (moved) toast('Moved to ' + label(PRI, pri) + '.'); return; }
-      S.db.collection('tasks').get().then(function (snap) { S.tasks = snap.docs.map(norm); render(); }, function () {});
+      if (ok) { if (moved) { toast('Moved to ' + label(PRI, pri) + '.'); notify('changed a priority from ' + label(PRI, wasPri) + ' to ' + label(PRI, pri), t); } return; }
+      S.db.collection('tasks').get().then(function (snap) { readSnap(snap); render(); }, function () {});
     });
   });
+
+  /* ---------- email alert settings ---------- */
+  var ndlg = $('ndlg');
+  function closeN() { if (ndlg.open) { if (ndlg.close) ndlg.close(); else ndlg.removeAttribute('open'); } }
+  function saveNotify(url, done) {
+    write('_settings', 'create', function () {
+      return S.db.doc('tasks/_settings').set({ kind: 'settings', notifyUrl: url, updatedAt: new Date().toISOString() });
+    }).then(function (ok) { if (ok) { closeN(); toast(done); } else $('n-err').textContent = 'That did not save. Try again.'; });
+  }
+  $('notify-btn').addEventListener('click', function () {
+    $('n-url').value = S.notifyUrl; $('n-err').textContent = '';
+    $('n-status').textContent = S.notifyUrl ? 'Email alerts are on.' : 'Email alerts are off.';
+    $('n-off').hidden = !S.notifyUrl;
+    if (!ndlg.open) { if (ndlg.showModal) ndlg.showModal(); else ndlg.setAttribute('open', ''); }
+    $('n-url').focus();
+  });
+  $('n-close').addEventListener('click', closeN);
+  ndlg.addEventListener('click', function (ev) { if (ev.target === ndlg) closeN(); });
+  function readUrl() {
+    var u = $('n-url').value.trim();
+    if (validUrl(u)) { $('n-err').textContent = ''; return u; }
+    $('n-err').textContent = 'That link does not look right. It should start with https://script.google.com/macros/s/ and end with /exec.';
+    $('n-url').focus();
+    return '';
+  }
+  $('n-test').addEventListener('click', function () {
+    var u = readUrl(); if (!u) return;
+    $('n-status').textContent = 'Sending a test email...';
+    sendMail(u, 'Task Desk: test email', ['Email alerts from your Task Desk board are working.', '', 'Open the board: ' + location.origin + location.pathname]).then(function (ok) {
+      $('n-status').textContent = ok ? 'Test sent. Check your inbox in a minute. If nothing arrives, recheck the Google setup steps.' : 'The test could not be sent. Check your connection and the link.';
+    });
+  });
+  $('n-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var u = readUrl(); if (u) saveNotify(u, 'Email alerts are on.');
+  });
+  $('n-off').addEventListener('click', function () { saveNotify('', 'Email alerts are off.'); });
 
   /* ---------- who is using the board ---------- */
   var who = $('who');
@@ -1304,7 +1416,7 @@ var FIREBASE_CONFIG = {
     } catch (e) { S.state = 'unavailable'; S.msg = 'The board could not start. Reload the page.'; render(); return; }
     S.db.collection('tasks').onSnapshot({ includeMetadataChanges: true }, function (snap) {
       S.state = 'live';
-      S.tasks = snap.docs.map(norm);
+      readSnap(snap);
       S.pending = !!(snap.metadata && snap.metadata.hasPendingWrites);
       render();
     }, function (e) {
